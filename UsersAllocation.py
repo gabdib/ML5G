@@ -10,120 +10,223 @@ from matplotlib.collections import LineCollection
 IOT_TYPE = 'iot'
 MMB_TYPE = 'mmb'
 
+
 # Stores user generation order strategy
 class UserGenOrder(Enum):
     FIRST_MMB = 'firstMmb'
     FIRST_IOT = 'firstIot'
     SHUFFLE = 'shuffle'
 
-# Generates
-def generateUsers(maxX, maxY, totUsers, iotUsersPercent, userGenOrder = UserGenOrder.SHUFFLE):
+
+# Generates users
+def generateUsers(max_x, max_y, tot_users, iot_users_percent, user_gen_order=UserGenOrder.SHUFFLE):
 
     # MMB users percent (of totUsers)
-    mmbUsersPercent = 1.0 - iotUsersPercent
+    mmb_users_percent = 1.0 - iot_users_percent
 
     # Number of IoT users
-    numIotUsers = round(totUsers * iotUsersPercent)
+    num_iot_users = round(tot_users * iot_users_percent)
 
     # Number of MMB users
-    numMmbUsers = round(totUsers * mmbUsersPercent)
+    num_mmb_users = round(tot_users * mmb_users_percent)
 
     # Generating users in random locations
     users = pd.DataFrame()
-    for r in range(totUsers):
-        users.at[r, 'x'] = random.random() * maxX
-        users.at[r, 'y'] = random.random() * maxY
+    for r in range(tot_users):
+        users.at[r, 'x'] = random.random() * max_x
+        users.at[r, 'y'] = random.random() * max_y
 
         # Assigning user type according to current index and userGenOrder value
-        if (r >= numMmbUsers and userGenOrder is UserGenOrder.FIRST_MMB) or \
-                (r < numIotUsers and userGenOrder is not UserGenOrder.FIRST_MMB):
+        if (r >= num_mmb_users and user_gen_order is UserGenOrder.FIRST_MMB) or \
+                (r < num_iot_users and user_gen_order is not UserGenOrder.FIRST_MMB):
             users.at[r, 'type'] = IOT_TYPE
         else:
             users.at[r, 'type'] = MMB_TYPE
 
     # Shuffling users
-    if (userGenOrder is UserGenOrder.SHUFFLE):
+    if user_gen_order is UserGenOrder.SHUFFLE:
         users = users.sample(frac=1).reset_index(drop=True)
 
-    print('Generated', numIotUsers, 'IoT users and', numMmbUsers, 'MMB users')
+    print('Generated', num_iot_users, 'IoT users and', num_mmb_users, 'MMB users')
 
     return users
+
 
 # Maximum number of physical resource blocks
 MAX_PRB = 25
 
-class User:
-    def __init__(self, nprb, nSubcarrier, dfc, f, modOrder, overhead, color, marker):
+# Computes cartesian distance
+def compute_distance(x1, y1, x2, y2):
+    dist = math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+    if dist < 3:
+        dist = 3
 
-        # Number of pyshical resource blocks
-        self.nprb = nprb
+    return dist
+
+
+# Computes l0 (used in path loss computation)
+def getl0(d0 = 1, f = 2.4e9):
+    c = 3e8
+    l0 = 10 * math.log10(((4 * math.pi * d0) * f / c) ** 2)
+    return l0
+
+def compute_path_loss_by_distance(x1, y1, x2, y2, gamma=3):
+    dist = compute_distance(x1, y1, x2, y2)
+    return compute_path_loss(dist, gamma)
+
+# Computes path loss
+def compute_path_loss(distance, gamma=3):
+    return getl0() + 10 * gamma * math.log10(distance)
+
+
+class User:
+    def __init__(self, parameters):
+
+        # Number of physical resource blocks
+        self.num_prb = parameters['num_prb']
 
         # Number of subcarrier
-        self.nSubcarrier = nSubcarrier
+        self.num_of_subcarrier = parameters['num_of_subcarrier']
 
         # Frequency slice [kHz]
-        self.dfc = dfc
-
-        # [kHz]
-        self.wprb = dfc * nSubcarrier
+        self.dfc = parameters['dfc']
 
         # [dB]
-        self.f = f
+        self.f = parameters['f']
 
-        # Mod order [bit/sym]
-        self.modOrder = modOrder
-
-        # Noise [dBm]
-        self.noise = -173.977 + f + 10 * math.log10(self.wprb * nprb)
+        # Power [dBm]
+        self.pt = parameters['pt']
 
         # 1 - overhead
-        self.overhead = overhead
+        self.overhead = parameters['overhead']
 
         # Plot color
-        self.color = color
+        self.color = parameters['color']
 
         # Plot marker
-        self.marker = marker
+        self.marker = parameters['marker']
+
+        self.ebn0_t = parameters['ebn0_t']
+
+        # [dB]
+        self.qpsk = None
+        if 'qpsk' in parameters:
+            self.qpsk = parameters['qpsk']
+
+        # [dB]
+        self.qam16 = None
+        if '16qam' in parameters:
+            self.qam16 = parameters['16qam']
+
+        # [dB]
+        self.qam64 = None
+        if 'qam64' in parameters:
+            self.qam64 = parameters['64qam']
 
         # Bandwidth [kHz]
         self.bandwidth = 4500
 
         # Number of symbol
-        self.nSymbol = 13
+        self.num_symbol = 13
 
         # Number of symbols for slot
-        self.nSymSlot = self.nSymbol / 14
+        self.num_sym_slot = self.num_symbol / 14
 
         # Number of layer (MIMO)
-        self.nLayer = 1
+        self.num_layer = 1
 
         # Maximum scaling factor
-        self.scalingFactor = 1
+        self.scaling_factor = 1
 
         # R coding
-        self.rCoding = 948 / 1024
+        self.r_coding = 948 / 1024
 
-    # Gets the maximum bitrate [Mbit/s]
-    def getMaxBitRate(self):
-        maxBitRate = self.nLayer * self.modOrder * self.scalingFactor * self.rCoding
-        maxBitRate *= self.nSymSlot * self.overhead * MAX_PRB
-        maxBitRate *= 1000 * 14 * 10 / 1000000
-        return maxBitRate
+    def get_mod_order(self, path_loss):
 
+        ebn0 = self.get_eb_n0(path_loss)
 
-# Defining l0 (used in path loss computation)
-d0 = 1  # m
-f = 24  # Gh
-l0 = 10 * math.log10(((4 * math.pi * d0) / f) ** 2)
+        if self.qpsk is not None:
+            if ebn0 < self.qpsk:
+                return 2
+            elif self.qam16 is not None and self.qpsk <= ebn0 < self.qam16:
+                return 4
+            elif self.qam64 is not None:
+                if self.qam16 <= ebn0 < self.qam64:
+                    return 6
+                elif ebn0 > self.qam64:
+                    return 8
+
+        if ebn0 > self.ebn0_t:
+            return 1
+        else:
+            return 0
+
+    # Gets width of a PRB [kHz]
+    def get_wprb(self):
+        return self.dfc * self.num_of_subcarrier
+
+    # Gets noise [dBm]
+    def get_noise(self):
+        # [dBm]
+        return -173.977 + self.f + 10 * math.log10(self.get_wprb() * self.num_prb)
+
+    def get_eb_n0(self, path_loss):
+        return self.pt - path_loss - self.get_noise()
+
+    def is_visible(self, user_x, user_y, bs_x, bs_y, gamma=3):
+
+        # Computing distance
+        dist = compute_distance(user_x, user_y, bs_x, bs_y)
+
+        # Computing path loss
+        path_loss = compute_path_loss(dist, gamma)
+
+        ebn0 = self.get_eb_n0(path_loss)
+
+        return ebn0 >= self.ebn0_t
+
+    # Gets the maximum bit rate [Mbit/s]
+    def get_bit_rate(self, path_loss = 100):
+        max_bit_rate = self.num_layer * self.scaling_factor * self.r_coding
+        max_bit_rate *= self.num_sym_slot * self.get_mod_order(path_loss) * self.overhead * self.num_prb
+        max_bit_rate *= 1000 * 14 * 10 / 1000000
+        return max_bit_rate
+
 
 # True: a base station could connect only a user type (IoT or MMB)
-isBSExclusive = False
+is_bs_exclusive = False
 
+mmbUser = User({
+    'num_prb': 9,
+    'num_of_subcarrier': 12,
+    'dfc': 15,
+    'f': 4,
+    'pt': 20,
+    'mod_order': 6,
+    'ebn0_t': 10,
+    'qpsk':6,
+    '16qam':12,
+    '64qam':18,
+    'overhead': 1,
+    'color': 'b',
+    'marker': ','
+})
 # Creating MMB user
-mmbUser = User(9, 12, 15, 4, 6, 1, 'b', ',')
 
 # Creating IoT user
-iotUser = User(1, 12, 15, 7, 2, 0.86, 'g', '.')
+iotUser = User({
+    'num_prb': 1,
+    'num_of_subcarrier': 12,
+    'dfc': 15,
+    'f': 7,
+    'pt': 0,
+    'mod_order': 2,
+    'ebn0_t': 0,
+    'qpsk':0,
+    'overhead': 0.86,
+    'color': 'g',
+    'marker': '.'
+})
 
 # Gets user by type
 def getUser(type):
@@ -172,7 +275,7 @@ def plotPositions(bs, users, connections=None):
                 x1, x2 = users.iloc[int(conn.uIdx)].x, bs.iloc[bsi].x
                 y1, y2 = users.iloc[int(conn.uIdx)].y, bs.iloc[bsi].y
 
-                if (not math.isinf(x1) and not math.isinf(y1)):
+                if not math.isinf(x1) and not math.isinf(y1):
                     ax.plot([y1, y2], [x1, x2], color=getColor(conn.type), alpha=0.2)
             else:
                 # Highlighting users not connected
@@ -181,85 +284,126 @@ def plotPositions(bs, users, connections=None):
                 ax.add_artist(circle)
 
 
-# Computes cartesian distance
-def computeDistance(x1, y1, x2, y2):
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+def evaluate_solution(connections, tot_users):
 
-# Computes path loss
-def computePathLoss(distance, gamma=3):
-    return l0 + 10 * gamma * math.log10(distance)
+    # Getting the total network bit rate
+    tot_bit_rate = connections.bitRate.sum()
 
-# Computes path losses for all users/base statiions combinations
-def computePathLosses(bs, users):
-    pathLosses = []
+    # Getting percentage of users non connected
+    disc_users_percent = connections[connections.bsIdx.isnull()].shape[0] / tot_users * 100
+
+    solution_result = {
+        'tot_bit_rate': tot_bit_rate,
+        'disc_users_percent': disc_users_percent
+    }
+
+    return solution_result
+
+
+# Computes path losses for all users/base stations combinations
+def compute_path_losses(bs, users):
+    path_losses = []
     for ui, user in users.iterrows():
         for bsi, base in bs.iterrows():
+
             # Computing distance between user and base station
-            dist = computeDistance(user.x, user.y, base.x, base.y)
+            dist = compute_distance(user.x, user.y, base.x, base.y)
 
             # Computing path loss between user and base station
-            pathLoss = computePathLoss(dist)
+            path_loss = compute_path_loss(dist)
 
-            pathLosses.append([bsi, ui, user.type, pathLoss])
+            path_losses.append([bsi, ui, user.type, path_loss])
 
-    return pd.DataFrame(pathLosses, columns=['bsIdx', 'uIdx', 'type', 'pathLoss'])
+    return pd.DataFrame(path_losses, columns=['bsIdx', 'uIdx', 'type', 'pathLoss'])
+
 
 # Computes BS/users minimum path loss connections
-def computeMinPathLossesConnections(bs, pathLosses):
+def compute_min_path_losses_connections(bs, path_losses):
     # Setting to max the PRB available for the base stations
     bs['freePrb'] = MAX_PRB
 
-    if (isBSExclusive):
+    if is_bs_exclusive:
         bs['bsType'] = None
 
-    minPathLossConn = pd.DataFrame({'uIdx': pathLosses.uIdx.unique()})
-    minPathLossConn['bsIdx'] = None
-    minPathLossConn['type'] = None
-    minPathLossConn['pathLoss'] = math.inf
-    minPathLossConn['bitRate'] = 0
+    connections = pd.DataFrame({'uIdx': path_losses.uIdx.unique()})
+    connections['bsIdx'] = None
+    connections['type'] = None
+    connections['pathLoss'] = math.inf
+    connections['bitRate'] = 0
 
-    userPathLosses = pathLosses.sort_values(by='pathLoss').groupby('uIdx')
+    user_path_losses = path_losses.sort_values(by='pathLoss').groupby('uIdx')
 
     # Iterating on user path loss grouped by index
-    for uIdx, userPathLoss in userPathLosses:
+    for user_index, user_path_loss in user_path_losses:
         # Iterating on single users
-        for rowIdx, row in userPathLoss.iterrows():
+        for row_index, row in user_path_loss.iterrows():
 
             # Computing free PRB for current base station
-            freePrb = bs.at[row.bsIdx, 'freePrb'] - getUser(row.type).nprb
+            free_prb = bs.at[row.bsIdx, 'freePrb'] - getUser(row.type).num_prb
 
             # A BS is considered valid (just in case of exclusive BS hypothesis)
             # when its type is the same as the user
-            isValidBS = True
-            if (isBSExclusive and bs.at[row.bsIdx, 'bsType'] is not None):
-                isValidBS = bs.at[row.bsIdx, 'bsType'] == row.type
+            is_valid_bs = True
+            if is_bs_exclusive and bs.at[row.bsIdx, 'bsType'] is not None:
+                is_valid_bs = bs.at[row.bsIdx, 'bsType'] == row.type
 
-            if (freePrb >= 0 and isValidBS):
+            if (free_prb >= 0 and is_valid_bs):
 
                 # Reducing the available PRB for current base station
-                bs.at[row.bsIdx, 'freePrb'] = freePrb
+                bs.at[row.bsIdx, 'freePrb'] = free_prb
 
-                if (isBSExclusive):
+                if is_bs_exclusive:
                     bs.at[row.bsIdx, 'bsType'] = row.type
 
                 # Allocating current user (uIdx) to current base station (row.bsIdx)
-                minPathLossConn.at[uIdx, 'pathLoss'] = row.pathLoss
-                minPathLossConn.at[uIdx, 'type'] = row.type
-                minPathLossConn.at[uIdx, 'bsIdx'] = int(row.bsIdx)
-                minPathLossConn.at[uIdx, 'uIdx'] = row.uIdx
-                minPathLossConn.at[uIdx, 'bitRate'] = getUser(row.type).getMaxBitRate()
+                connections.at[user_index, 'pathLoss'] = row.pathLoss
+                connections.at[user_index, 'type'] = row.type
+                connections.at[user_index, 'bsIdx'] = int(row.bsIdx)
+                connections.at[user_index, 'uIdx'] = row.uIdx
+                connections.at[user_index, 'bitRate'] = getUser(row.type).get_bit_rate(row.pathLoss)
 
                 break
 
-    return minPathLossConn
+    return connections
+
 
 class GeneticAllocation:
+
     def __init__(self, bs, users):
         self.bs = bs
         self.users = users
         self.population = {}
 
-    def generatePopulation(self, population_size = 100):
+    def genetic_evolution(self, num_of_generation=10, population_size=100):
+
+        # Generating the first generation of the population
+        self.generate_population()
+
+        solution_size = len(self.population)
+
+        # Evolving population for num_of_generation generations
+        for actual_generation in range(num_of_generation):
+
+            # Computing best two individuals
+            first_best_individual, second_best_individual = self.fitness()
+
+            # Crossing-over the best two individuals
+            next_gen_individual = self.crossover(first_best_individual, second_best_individual)
+
+            # Evaluating current solution
+            solution = evaluate_solution(next_gen_individual, solution_size)
+
+            print("Generation:", actual_generation + 1, "results")
+            print('Total bit rate:', solution['tot_bit_rate'], '[Mbit/s]')
+            print('Users disconnected:', solution['disc_users_percent'], '%')
+
+            if actual_generation is not num_of_generation:
+                # Mutating next generation individual prototype
+                self.population = self.mutation(next_gen_individual)
+
+        return next_gen_individual
+
+    def generate_population(self, population_size = 100):
 
         self.population = {}
 
@@ -285,12 +429,12 @@ class GeneticAllocation:
                     bs_index = random.choice(bs_indexes)
 
                     # Computing free PRB for current base station
-                    free_prb = self.bs.at[bs_index, 'freePrb'] - getUser(user.type).nprb
+                    free_prb = self.bs.at[bs_index, 'freePrb'] - getUser(user.type).num_prb
 
                     # A BS is considered valid (just in case of exclusive BS hypothesis)
                     # when its type is the same as the user
                     is_valid_bs = True
-                    if (isBSExclusive and self.bs.at[bs_index, 'type'] is not None):
+                    if (is_bs_exclusive and self.bs.at[bs_index, 'type'] is not None):
                         is_valid_bs = self.bs.at[bs_index, 'type'] == user.type
 
                     if (free_prb >= 0 and is_valid_bs):
@@ -298,12 +442,15 @@ class GeneticAllocation:
                         # Reducing the available PRB for current base station
                         self.bs.at[bs_index, 'freePrb'] = free_prb
 
-                        if (isBSExclusive):
+                        if is_bs_exclusive:
                             self.bs.at[bs_index, 'type'] = user.type
+
+                        base_station = self.bs.iloc[bs_index]
+                        path_loss = compute_path_loss_by_distance(user.x, user.y, base_station.x, base_station.y)
 
                         # Populating individual values
                         individual.at[uIdx, "bsIdx"] = bs_index
-                        individual.at[uIdx, 'bitRate'] = getUser(user.type).getMaxBitRate()
+                        individual.at[uIdx, 'bitRate'] = getUser(user.type).get_bit_rate(path_loss)
 
                         break
                     else:
@@ -326,12 +473,29 @@ class GeneticAllocation:
             bs_not_alloc = individual[individual.bsIdx.isnull()].shape[0]
             population_fitness.at[individual_index, 'users_disc_percent'] = bs_not_alloc / population_size * 100
 
+        # Sorting population by best fitness
         population_fitness = population_fitness.sort_values(['tot_bit_rate', 'users_disc_percent'],
                                                             ascending=[False, True])
-
-        #print(population_fitness)
-
+        
+        # Getting first/second best fitness individual
         first_best_fitness = self.population[population_fitness.index.values[0]]
         second_best_fitness = self.population[population_fitness.index.values[1]]
 
         return first_best_fitness, second_best_fitness
+
+    def crossover(self, first_best_fitness, second_best_fitness):
+        next_gen_individual = first_best_fitness
+
+        #TODO fare il merge del first e del second (considerando i vincoli su i PRB delle BS disponibili)
+
+        return next_gen_individual
+
+    def mutation(self, next_gen_individual):
+        population_size = len(self.population)
+        new_population = {}
+        for individual_index in range(population_size):
+            mutant = next_gen_individual
+            # TODO: mutazione individuo
+            new_population[individual_index] = mutant
+
+        return new_population
