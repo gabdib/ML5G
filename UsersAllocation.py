@@ -187,18 +187,15 @@ class User:
 
     # Gets noise [dBm]
     def get_noise(self):
-        return -173.977 + self.f + 10 * math.log10(self.get_wprb() * self.num_prb)
+        return -173.977 + self.f + 10 * math.log10(self.get_wprb()*1e3 * self.num_prb)
 
     def get_eb_n0(self, path_loss):
-        print('pt:', self.pt, '; noise:', self.get_noise())
         return self.pt - path_loss - self.get_noise()
 
     def is_visible_by_path_loss(self, path_loss, gamma=3):
 
         # Computing Eb/N0
         ebn0 = self.get_eb_n0(path_loss)
-
-        print('path loss:', path_loss, 'ebn0:', ebn0, '; ebno_t: ', self.ebn0_t)
 
         return ebn0 >= self.ebn0_t
 
@@ -222,6 +219,11 @@ class User:
         bit_rate *= self.num_sym_slot * self.get_mod_order(path_loss) * self.overhead * self.num_prb
         bit_rate *= 1000 * 14 * 10 / 1000000
         return bit_rate
+
+    # Gets the bit rate by user/bs position [Mbit/s]
+    def get_bit_rate_by_position(self, user_x, user_y, bs_x, bs_y):
+        path_loss = compute_path_loss_by_distance(user_x, user_y, bs_x, bs_y)
+        return self.get_bit_rate(path_loss)
 
 
 # True: a base station could connect only a user type (IoT or MMB)
@@ -398,8 +400,6 @@ def compute_min_path_losses_connections(bs, path_losses):
             # Computing visibility according to bs/users path loss
             is_visible = get_user(row.type).is_visible_by_path_loss(row.pathLoss)
 
-            print(is_visible)
-
             if free_prb >= 0 and is_valid_bs and is_visible:
 
                 # Reducing the available PRB for current base station
@@ -439,6 +439,8 @@ class GeneticAllocation:
         # Evolving population for num_of_generation generations
         for actual_generation in range(num_of_generation):
 
+            print("Generation:", actual_generation + 1)
+
             # Computing best two individuals
             first_best_individual, second_best_individual = self.fitness()
 
@@ -448,7 +450,6 @@ class GeneticAllocation:
             # Evaluating current solution
             solution = evaluate_solution(next_gen_individual, solution_size)
 
-            print("Generation:", actual_generation + 1, "results")
             print('Total bit rate:', solution['tot_bit_rate'], '[Mbit/s]')
             print('Users disconnected:', solution['disc_users_percent'], '%')
 
@@ -478,6 +479,8 @@ class GeneticAllocation:
                 individual.at[uIdx, "uIdx"] = int(uIdx)
                 individual.at[uIdx, "type"] = user.type
                 individual.at[uIdx, 'bitRate'] = 0
+                individual.at[uIdx, 'x'] = user.x
+                individual.at[uIdx, 'y'] = user.y
 
                 bs_indexes = list(range(0, max_bs_index))
                 while bs_indexes:
@@ -498,8 +501,6 @@ class GeneticAllocation:
 
                     # Computing visibility between current bs and current user
                     is_visible = get_user(user.type).is_visible_by_path_loss(path_loss)
-
-                    print(is_visible)
 
                     if free_prb >= 0 and is_valid_bs and is_visible:
 
@@ -551,12 +552,81 @@ class GeneticAllocation:
 
         return next_gen_individual
 
-    def mutation(self, next_gen_individual):
+    def mutation(self, next_gen_individual, mutation_rate=0.1):
         population_size = len(self.population)
         new_population = {}
+
+        max_user_index = len(self.users)
+
+        mutation_size = int(max_user_index*mutation_rate)
+
         for individual_index in range(population_size):
             mutant = next_gen_individual
-            # TODO: mutazione individuo
+
+            individual = self.population[individual_index]
+
+            source_user_indexes = list(range(0, max_user_index))
+            mutation_done = 0
+
+            while source_user_indexes and mutation_size >= mutation_done:
+
+                # Getting source user
+                source_user_index = random.choice(source_user_indexes)
+                source_user = individual.iloc[source_user_index]
+                source_user_prb = get_user(source_user.type).num_prb
+
+                if source_user['bsIdx'] is None:
+                    source_user_indexes.remove(source_user_index)
+                    continue
+
+                target_user_indexes = list(range(0, max_user_index))
+                while target_user_indexes:
+
+                    # Getting target user
+                    target_user_index = random.choice(target_user_indexes)
+                    target_user = individual.iloc[target_user_index]
+                    target_user_prb = get_user(target_user.type).num_prb
+
+                    if source_user_prb == target_user_prb:
+
+                        # Getting source/target bs
+                        source_bs = self.bs.iloc[int(source_user['bsIdx'])]
+
+                        is_source_visible = get_user(source_user.type).is_visible_by_position(
+                            source_bs.x, source_bs.y, target_user.x, target_user.y)
+
+                        if target_user['bsIdx'] is not None:
+                            target_bs = self.bs.iloc[int(target_user['bsIdx'])]
+                            is_target_visible = get_user(target_user.type).is_visible_by_position(
+                                source_user.x, source_user.y, target_bs.x, target_bs.y)
+                        else:
+                            target_bs = None
+                            is_target_visible = True
+
+                        if is_source_visible and is_target_visible:
+                            # Computing new source bit rate
+                            if target_bs is not None:
+                                mutant.at[source_user_index, 'bitRate'] = get_user(source_user.type)\
+                                    .get_bit_rate_by_position( source_user.x, source_user.y, target_bs.x, target_bs.y)
+                            else:
+                                mutant.at[source_user_index, 'bitRate'] = 0
+
+                            # Computing new target bit rate
+                            mutant.at[target_user_index, 'bitRate'] = get_user(source_user.type)\
+                                .get_bit_rate_by_position(target_user.x, target_user.y, source_bs.x, source_bs.y)
+
+                            # Mutating individual
+                            mutant.at[target_user_index, 'bsIdx'] = source_user['bsIdx']
+                            mutant.at[source_user_index, 'bsIdx'] = target_user['bsIdx']
+
+                            mutation_done = mutation_done + 1
+
+                            break
+                    else:
+                        target_user_indexes.remove(target_user_index)
+
+                source_user_indexes.remove(source_user_index)
+
             new_population[individual_index] = mutant
 
         return new_population
