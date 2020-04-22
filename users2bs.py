@@ -69,22 +69,42 @@ class UsersGenerator:
 
         # Generating users in random locations
         users = pd.DataFrame()
-        for r in range(self.tot_users):
-            users.at[r, 'x'] = random.random() * self.max_x
-            users.at[r, 'y'] = random.random() * self.max_y
+        for user_index in range(self.tot_users):
+            users.at[user_index, 'x'] = random.random() * self.max_x
+            users.at[user_index, 'y'] = random.random() * self.max_y
+            users.at[user_index, 'u_index'] = int(user_index)
 
             # Assigning user type according to current index and userGenOrder value
-            if (r >= self.num_mmb_users and user_gen_order is UserGenOrder.FIRST_MMB) or \
-                    (r < self.num_iot_users and user_gen_order is not UserGenOrder.FIRST_MMB):
-                users.at[r, 'type'] = IOT_TYPE
+            if (user_index >= self.num_mmb_users and user_gen_order is UserGenOrder.FIRST_MMB) or \
+                    (user_index < self.num_iot_users and user_gen_order is not UserGenOrder.FIRST_MMB):
+                users.at[user_index, 'type'] = IOT_TYPE
             else:
-                users.at[r, 'type'] = MMB_TYPE
+                users.at[user_index, 'type'] = MMB_TYPE
 
         # Shuffling users
         if user_gen_order is UserGenOrder.SHUFFLE:
             users = users.sample(frac=1).reset_index(drop=True)
 
         return users
+
+    @staticmethod
+    def order_users(users, user_gen_order):
+
+        if user_gen_order is UserGenOrder.SHUFFLE:
+            # Shuffling users
+            ordered_users = users.sample(frac=1).reset_index(drop=True)
+        else:
+            if user_gen_order is UserGenOrder.FIRST_IOT:
+                ascending = True
+            else:
+                ascending = False
+
+            # Sorting users by type
+            ordered_users = users.sort_values(by=['type'], ascending=ascending)
+
+        ordered_users.reset_index(inplace=True)
+
+        return ordered_users
 
 
 # Maximum number of physical resource blocks
@@ -253,6 +273,14 @@ class User:
         path_loss = compute_path_loss_by_distance(user_x, user_y, bs_x, bs_y)
         return self.get_bit_rate(path_loss)
 
+    # Gets the bit rate by user/bs index [Mbit/s]
+    def get_bit_rate_by_bs(self, user_x, user_y, bs, bs_index):
+        if bs_index is not None:
+            base_station = bs.iloc[bs_index]
+            return self.get_bit_rate_by_position(user_x, user_y, base_station.x, base_station.y)
+        else:
+            return 0
+
 
 # True: a base station could connect only a user type (IoT or MMB)
 is_bs_exclusive = False
@@ -333,12 +361,12 @@ def plot_positions(bs, users, connections=None):
     # Plotting user/base station connections
     if connections is not None:
         for ui, conn in connections.iterrows():
-            if conn.bsIdx is not None:
-                bsi = int(conn.bsIdx)
+            if conn.bs_index is not None:
+                bsi = int(conn.bs_index)
 
                 # Getting user/base station locations
-                x1, x2 = users.iloc[int(conn.uIdx)].x, bs.iloc[bsi].x
-                y1, y2 = users.iloc[int(conn.uIdx)].y, bs.iloc[bsi].y
+                x1, x2 = users.iloc[int(conn.u_index)].x, bs.iloc[bsi].x
+                y1, y2 = users.iloc[int(conn.u_index)].y, bs.iloc[bsi].y
 
                 if not math.isinf(x1) and not math.isinf(y1):
                     ax.plot([y1, y2], [x1, x2], color=get_color(conn.type), alpha=0.2)
@@ -352,10 +380,10 @@ def plot_positions(bs, users, connections=None):
 def evaluate_solution(connections, tot_users):
 
     # Getting the total network bit rate
-    tot_bit_rate = connections.bitRate.sum()
+    tot_bit_rate = connections.bit_rate.sum()
 
     # Getting percentage of users non connected
-    disc_users_percent = connections[connections.bsIdx.isnull()].shape[0] / tot_users * 100
+    disc_users_percent = connections[connections.bs_index.isnull()].shape[0] / tot_users * 100
 
     solution_result = {
         'tot_bit_rate': tot_bit_rate,
@@ -388,80 +416,88 @@ def compute_path_losses(bs, users):
 
             # Computing path loss between user and base station
             path_loss = compute_path_loss(dist)
-
             path_losses.append([bsi, ui, user.type, user.x, user.y, path_loss])
 
-    return pd.DataFrame(path_losses, columns=['bsIdx', 'uIdx', 'type', 'x', 'y', 'pathLoss'])
+    return pd.DataFrame(path_losses, columns=['bs_index', 'u_index', 'type', 'x', 'y', 'path_loss'])
 
 
 def compute_bs_free_prb(bs, connections):
 
-    bs['freePrb'] = MAX_PRB
+    bs['free_prb'] = MAX_PRB
 
     for connection_index, connection in connections.iterrows():
-        if connection['bsIdx'] is not None:
-            bs_index = int(connection['bsIdx'])
-            bs.at[bs_index, 'freePrb'] -= get_user(connection.type).num_prb
+        if connection['bs_index'] is not None:
+            bs_index = int(connection['bs_index'])
+            bs.at[bs_index, 'free_prb'] -= get_user(connection.type).num_prb
 
     return bs
 
 
 def get_free_prb_bs(bs, connections):
     bs = compute_bs_free_prb(bs, connections)
-    return bs[bs['freePrb'] > 0]
+    return bs[bs['free_prb'] > 0]
 
 
 # Computes BS/users minimum path loss connections
 def compute_min_path_losses_connections(bs, path_losses, consider_max_prb=True):
 
     # Setting to max the PRB available for the base stations
-    bs['freePrb'] = MAX_PRB
+    bs['free_prb'] = MAX_PRB
 
     if is_bs_exclusive:
-        bs['bsType'] = None
+        bs['bs_type'] = None
 
-    connections = pd.DataFrame({'uIdx': path_losses.uIdx.unique()})
-    connections['bsIdx'] = None
+    connections = pd.DataFrame({'u_index': path_losses.u_index.unique()})
+    connections['bs_index'] = None
     connections['type'] = None
-    connections['pathLoss'] = math.inf
-    connections['bitRate'] = 0.0
+    connections['path_loss'] = math.inf
+    connections['bit_rate'] = 0.0
+    connections['x'] = None
+    connections['y'] = None
 
-    user_path_losses = path_losses.sort_values(by='pathLoss').groupby('uIdx')
+    if consider_max_prb:
+        user_path_losses = path_losses.groupby('u_index')
+    else:
+        user_path_losses = path_losses.sort_values(by='path_loss').groupby('u_index')
 
     # Iterating on user path loss grouped by index
     for user_index, user_path_loss in user_path_losses:
+
         # Iterating on single users
         for row_index, row in user_path_loss.iterrows():
 
             # Computing free PRB for current base station
-            free_prb = bs.at[row.bsIdx, 'freePrb'] - get_user(row.type).num_prb
+            free_prb = bs.at[row.bs_index, 'free_prb'] - get_user(row.type).num_prb
 
             is_free_prb = free_prb >= 0 or not consider_max_prb
 
             # A BS is considered valid (just in case of exclusive BS hypothesis)
             # when its type is the same as the user
             is_valid_bs = True
-            if is_bs_exclusive and bs.at[row.bsIdx, 'bsType'] is not None:
+            if is_bs_exclusive and bs.at[row.bs_index, 'bs_type'] is not None:
 
-                is_valid_bs = bs.at[row.bsIdx, 'bsType'] == row.type
+                is_valid_bs = bs.at[row.bs_index, 'bs_type'] == row.type
 
             # Computing visibility according to bs/users path loss
-            is_visible = get_user(row.type).is_visible_by_path_loss(row.pathLoss)
+            is_visible = get_user(row.type).is_visible_by_path_loss(row.path_loss)
+
+            connections.at[user_index, 'u_index'] = row.u_index
+            connections.at[user_index, 'x'] = row.x
+            connections.at[user_index, 'y'] = row.y
+            connections.at[user_index, 'type'] = row.type
+            connections.at[user_index, 'path_loss'] = row.path_loss
 
             if is_free_prb and is_valid_bs and is_visible:
 
                 # Reducing the available PRB for current base station
-                bs.at[row.bsIdx, 'freePrb'] = free_prb
+                bs.at[row.bs_index, 'free_prb'] = free_prb
 
                 if is_bs_exclusive:
-                    bs.at[row.bsIdx, 'bsType'] = row.type
+                    bs.at[row.bs_index, 'bs_type'] = row.type
 
-                # Allocating current user (uIdx) to current base station (row.bsIdx)
-                connections.at[user_index, 'pathLoss'] = row.pathLoss
-                connections.at[user_index, 'type'] = row.type
-                connections.at[user_index, 'bsIdx'] = int(row.bsIdx)
-                connections.at[user_index, 'uIdx'] = row.uIdx
-                connections.at[user_index, 'bitRate'] = get_user(row.type).get_bit_rate(row.pathLoss)
+                # Allocating current user (u_index) to current base station (row.bs_index)
+                connections.at[user_index, 'bs_index'] = int(row.bs_index)
+                connections.at[user_index, 'bit_rate'] = get_user(row.type).get_bit_rate(row.path_loss)
 
                 break
 
@@ -470,21 +506,44 @@ def compute_min_path_losses_connections(bs, path_losses, consider_max_prb=True):
 
 class UsersAllocationPredictor:
 
-    def __init__(self, bs, classifier=svm.SVC()):
+    def __init__(self, bs, training='genetic', classifier=svm.SVC()):
+
+        # Base stations
         self.bs = bs
 
-        # Create a svm Classifier
+        # Training type (genetic or min_path_loss)
+        self.training = training
+
+        # Create a Classifier
         self.classifier = classifier
 
-    def train(self, tot_users, iot_users_percent, training_percent=0.7):
-        users_generator = UsersGenerator(self.bs.x.max(), self.bs.y.min(), tot_users, iot_users_percent)
-        users = users_generator.generate_users()
+    def train(self, tot_populations, tot_users, iot_users_percent, training_percent=0.7):
+
+        # Generating users
+        users_generator = UsersGenerator(self.bs.x.max(), self.bs.y.max(), tot_users, iot_users_percent)
+
+        if self.training == 'min_path_loss':
+            # Minimum path loss training
+            population = users_generator.generate_population(tot_populations)
+        else:
+            # Genetic training
+            users = users_generator.generate_users()
+            genetic_allocation = GeneticAllocation(self.bs, users)
+
+            # Computing best fitness population
+            population = genetic_allocation.generate_best_solutions(tot_populations, tot_users, iot_users_percent)
+
+        # Computing min path loss connections
+        for population_index in population:
+            users = population[population_index]
+            path_losses = compute_path_losses(self.bs, users)
+            population[population_index] = compute_min_path_losses_connections(self.bs, path_losses, False)
 
         # Adapting users pandas data frame to python array
-        X, y = self._adapt_users(users, True)
+        X, y = self._adapt_population(population, True)
 
         # Pre-train data adapting
-        y = UsersAllocationPredictor._pre_train_adapting(y)
+        X, y = UsersAllocationPredictor._pre_train_adapting(X, y)
 
         # Splitting data set into training set and test set
         X_train, X_test, y_train, y_test = train_test_split(X, y, train_size=training_percent)
@@ -499,21 +558,53 @@ class UsersAllocationPredictor:
 
     def predict(self, users):
 
+        # Computing min path loss connections
+        path_losses = compute_path_losses(self.bs, users)
+        users = compute_min_path_losses_connections(self.bs, path_losses, False)
+
         # Adapting users
         X, y = self._adapt_users(users)
+        X, y = self._pre_train_adapting(X, y)
 
         # Predicting BS
-        bs_prediction = self.classifier.predict(X)
-        bs_prediction = UsersAllocationPredictor._post_train_adapting(bs_prediction)
+        y = self.classifier.predict(X)
 
-        print(bs_prediction)
+        X, y = UsersAllocationPredictor._post_train_adapting(X, y)
 
         # Assigning to users the BS prediction
-        for index in range(0, len(bs_prediction)):
-            users.at[index, 'bsIdx'] = bs_prediction[index]
-            users.at[index, 'uIdx'] = int(index)
+        for index in range(0, len(y)):
+            user = users.iloc[index]
+            bs_index = int(y[index]) if y[index] != -1 else None
+            users.at[index, 'bs_index'] = bs_index
+            users.at[index, 'u_index'] = user['u_index']
+            users.at[index, 'bit_rate'] = get_user(user.type).get_bit_rate_by_bs(user.x, user.y, self.bs, bs_index)
+
+        users = users.where(pd.notnull(users), None)
 
         return users
+
+    def _adapt_population(self, population, generate_also_bs_indexes=False):
+
+        X = list()
+        y = None
+        if generate_also_bs_indexes:
+            y = list()
+
+        for population_index in population:
+            users = population[population_index]
+
+            for user_index, user in users.iterrows():
+                x_user = list()
+                x_user.insert(0, user.x)
+                x_user.insert(1, user.y)
+                x_user.insert(2, user.type)
+
+                X.insert(population_index, x_user)
+
+            if generate_also_bs_indexes:
+                y += users['bs_index'].tolist()
+
+        return X, y
 
     def _adapt_users(self, users, generate_also_bs_indexes=False):
 
@@ -526,31 +617,42 @@ class UsersAllocationPredictor:
             x_user = list()
             x_user.insert(0, user.x)
             x_user.insert(1, user.y)
+            x_user.insert(2, user.type)
 
-            X.insert(user_index, x_user)
+            X.append(x_user)
 
         if generate_also_bs_indexes:
-            path_losses = compute_path_losses(self.bs, users)
-            connections = compute_min_path_losses_connections(self.bs, path_losses, False)
-            y = connections['bsIdx'].tolist()
-            print(y)
+            y += users['bs_index'].tolist()
 
         return X, y
 
     @staticmethod
     def _replace_values(array, from_value, to_value):
         for index in range(0, len(array)):
+
+            if isinstance(array[index], list):
+                UsersAllocationPredictor._replace_values(array[index], from_value, to_value)
+
             if array[index] is from_value:
                 array[index] = to_value
+
         return array
 
     @staticmethod
-    def _pre_train_adapting(array):
-        return UsersAllocationPredictor._replace_values(array, None, -1)
+    def _pre_train_adapting(X, y):
+        X = UsersAllocationPredictor._replace_values(X, IOT_TYPE, 0)
+        X = UsersAllocationPredictor._replace_values(X, MMB_TYPE, 1)
+        if y is not None:
+            y = UsersAllocationPredictor._replace_values(y, None, -1)
+        return X, y
 
     @staticmethod
-    def _post_train_adapting(array):
-        return UsersAllocationPredictor._replace_values(array, -1, None)
+    def _post_train_adapting(X, y):
+        X = UsersAllocationPredictor._replace_values(X, 0, IOT_TYPE)
+        X = UsersAllocationPredictor._replace_values(X, 1, MMB_TYPE)
+        if y is not None:
+            y = UsersAllocationPredictor._replace_values(y, -1, None)
+        return X, y
 
 
 class GeneticAllocation:
@@ -591,11 +693,21 @@ class GeneticAllocation:
 
             if actual_generation < num_of_generation:
 
-                print('mutation')
                 # Mutating next generation individual prototype
                 self.population = self.mutation(next_gen_individual, mutation_rate)
 
         return next_gen_individual
+
+    def generate_best_solutions(self, num_solutions, tot_users, iot_users_percent):
+        users_generator = UsersGenerator(self.bs.x.max(), self.bs.y.max(), tot_users, iot_users_percent)
+
+        best_solutions = {}
+        for population_index in range(0, num_solutions):
+            self.users = users_generator.generate_users()
+            solution = self.genetic_evolution(1, tot_users)
+            best_solutions[population_index] = solution
+
+        return best_solutions
 
     def generate_population(self, population_size=100):
 
@@ -606,7 +718,7 @@ class GeneticAllocation:
         for individual_index in range(population_size):
 
             # Setting to max the PRB available for the base stations
-            self.bs['freePrb'] = MAX_PRB
+            self.bs['free_prb'] = MAX_PRB
 
             individual = pd.DataFrame()
 
@@ -615,14 +727,14 @@ class GeneticAllocation:
 
                 bs_index, bit_rate = self.__alloc_user_to_bs(user_index, user)
 
-                individual.at[user_index, "uIdx"] = int(user_index)
+                individual.at[user_index, "u_index"] = int(user_index)
                 individual.at[user_index, "type"] = user.type
                 individual.at[user_index, 'x'] = user.x
                 individual.at[user_index, 'y'] = user.y
-                individual.at[user_index, 'bsIdx'] = bs_index
-                individual.at[user_index, 'bitRate'] = bit_rate
+                individual.at[user_index, 'bs_index'] = bs_index
+                individual.at[user_index, 'bit_rate'] = bit_rate
 
-            # TODO: capire perché i bsIdx vengono impostati come NaN e non come None (poi rimuovere questa riga)
+            # TODO: capire perché i bs_index vengono impostati come NaN e non come None (poi rimuovere questa riga)
             individual = individual.where(pd.notnull(individual), None)
 
             # Inserting individual in population
@@ -635,8 +747,8 @@ class GeneticAllocation:
         for individual_index in self.population:
             individual = self.population[individual_index]
 
-            population_fitness.at[individual_index, 'tot_bit_rate'] = individual.bitRate.sum()
-            bs_not_alloc = individual[individual.bsIdx.isnull()].shape[0]
+            population_fitness.at[individual_index, 'tot_bit_rate'] = individual.bit_rate.sum()
+            bs_not_alloc = individual[individual.bs_index.isnull()].shape[0]
             population_fitness.at[individual_index, 'users_disc_percent'] = bs_not_alloc / users_size * 100
 
         # Sorting population by best fitness
@@ -677,23 +789,22 @@ class GeneticAllocation:
                 user_index = random.choice(user_indexes)
                 user = mutant.iloc[user_index]
 
-                if user['bsIdx'] is not None:
+                if user['bs_index'] is not None:
 
                     # Getting bs index
-                    bs_index = int(user['bsIdx'])
+                    bs_index = int(user['bs_index'])
 
                     # Disconnecting user
-                    mutant.at[user_index, 'bsIdx'] = None
-                    mutant.at[user_index, 'bitRate'] = 0.0
+                    mutant.at[user_index, 'bs_index'] = None
+                    mutant.at[user_index, 'bit_rate'] = 0.0
 
                     # Getting user PRB
                     user_prb = get_user(user.type).num_prb
 
                     # Updating free PRB
-                    self.bs.at[bs_index, 'freePrb'] += user_prb
-                    if self.bs.at[bs_index, 'freePrb'] > MAX_PRB:
-                        print('MAX PRB')
-                        self.bs.at[bs_index, 'freePrb'] = MAX_PRB
+                    self.bs.at[bs_index, 'free_prb'] += user_prb
+                    if self.bs.at[bs_index, 'free_prb'] > MAX_PRB:
+                        self.bs.at[bs_index, 'free_prb'] = MAX_PRB
 
                     mutation_done += 1
 
@@ -709,7 +820,7 @@ class GeneticAllocation:
             while len(get_free_prb_bs(self.bs, mutant)) and mutation_done < max_mutation_num:
 
                 # Getting user index (first MMB)
-                if mmb_user_indexes and self.bs['freePrb'].max() >= mmb_user_num_prb:
+                if mmb_user_indexes and self.bs['free_prb'].max() >= mmb_user_num_prb:
                     user_index = random.choice(mmb_user_indexes)
                     mmb_user_indexes.remove(user_index)
                 else:
@@ -718,13 +829,13 @@ class GeneticAllocation:
 
                 user = mutant.iloc[user_index]
 
-                if user['bsIdx'] is None:
+                if user['bs_index'] is None:
 
                     # Allocating user
                     bs_index, bit_rate = self.__alloc_user_to_bs(user_index, user)
                     if bs_index is not None:
-                        mutant.at[user_index, 'bsIdx'] = bs_index
-                        mutant.at[user_index, 'bitRate'] = bit_rate
+                        mutant.at[user_index, 'bs_index'] = bs_index
+                        mutant.at[user_index, 'bit_rate'] = bit_rate
 
                     mutation_done += 1
 
@@ -746,7 +857,9 @@ class GeneticAllocation:
             base_station = self.bs.iloc[bs_index]
 
             # Computing free PRB for current base station
-            free_prb = self.bs.at[bs_index, 'freePrb'] - get_user(user.type).num_prb
+            free_prb = self.bs.at[bs_index, 'free_prb'] - get_user(user.type).num_prb
+
+            is_free_prb = free_prb >= 0
 
             # A BS is considered valid (just in case of exclusive BS hypothesis)
             # when its type is the same as the user
@@ -760,12 +873,12 @@ class GeneticAllocation:
             # Computing visibility between current bs and current user
             is_visible = get_user(user.type).is_visible_by_path_loss(path_loss)
 
-            if free_prb >= 0 and is_valid_bs and is_visible:
+            if is_free_prb and is_valid_bs and is_visible:
 
                 # Reducing the available PRB for current base station
-                self.bs.at[bs_index, 'freePrb'] = free_prb
+                self.bs.at[bs_index, 'free_prb'] = free_prb
 
-                if is_bs_exclusive:
+                if is_bs_exclusive and self.bs.at[bs_index, 'type'] is None:
                     self.bs.at[bs_index, 'type'] = user.type
 
                 # Populating result values
