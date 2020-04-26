@@ -5,6 +5,8 @@ from enum import Enum
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from collections import Counter
+
 from sklearn import svm
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import train_test_split
@@ -332,7 +334,7 @@ def get_marker(user_type):
 
 
 # Plots base stations and users position
-def plot_positions(bs, users, connections=None):
+def plot_positions(bs, users, user_connections=None):
     # Getting MMB/IoT users
     mmb_users = users[users.type == MMB_TYPE]
     iot_users = users[users.type == IOT_TYPE]
@@ -340,9 +342,9 @@ def plot_positions(bs, users, connections=None):
     fig, ax = plt.subplots()
 
     # Plotting BS, MMB and IoT Users positions
-    ax.scatter(bs.y, bs.x, color='y', marker='^')
-    ax.scatter(mmb_users.y, mmb_users.x, color=get_color(MMB_TYPE), marker=get_marker(MMB_TYPE))
-    ax.scatter(iot_users.y, iot_users.x, color=get_color(IOT_TYPE), marker=get_marker(IOT_TYPE))
+    ax.scatter(bs.x, bs.y, color='y', marker='^')
+    ax.scatter(mmb_users.x, mmb_users.y, color=get_color(MMB_TYPE), marker=get_marker(MMB_TYPE))
+    ax.scatter(iot_users.x, iot_users.y, color=get_color(IOT_TYPE), marker=get_marker(IOT_TYPE))
 
     # Plotting labels and legend
     plt.ylabel('y')
@@ -355,24 +357,29 @@ def plot_positions(bs, users, connections=None):
     circle_size = (bs.x.max() + bs.y.max()) * 0.01
 
     # Plotting base station indexes
-    for i, j in bs.iterrows():
-        ax.annotate(i, (j.y + delta_y, j.x + delta_x), color='y')
+    for i, base_station in bs.iterrows():
+        ax.annotate(i, (base_station.x + delta_x, base_station.y + delta_y), color='y')
 
     # Plotting user/base station connections
-    if connections is not None:
-        for ui, conn in connections.iterrows():
-            if conn.bs_index is not None:
-                bsi = int(conn.bs_index)
+    if user_connections is not None:
+        for user_connection_index, user_connection in user_connections.iterrows():
+
+            if user_connection.bs_index is not None:
+
+                # Getting BS
+                bs_index = int(user_connection.bs_index)
+                base_station = bs.iloc[bs_index]
 
                 # Getting user/base station locations
-                x1, x2 = users.iloc[int(conn.u_index)].x, bs.iloc[bsi].x
-                y1, y2 = users.iloc[int(conn.u_index)].y, bs.iloc[bsi].y
+                x1, x2 = user_connection.x, base_station.x
+                y1, y2 = user_connection.y, base_station.y
 
+                # Plotting BS/user connection
                 if not math.isinf(x1) and not math.isinf(y1):
-                    ax.plot([y1, y2], [x1, x2], color=get_color(conn.type), alpha=0.2)
+                    ax.plot([x1, x2], [y1, y2], color=get_color(user_connection.type), alpha=0.2)
             else:
-                # Highlighting users not connected
-                pos = (users.loc[int(ui), 'y'], users.loc[int(ui), 'x'])
+                # Highlighting not connected user
+                pos = (user_connection.x, user_connection.y)
                 circle = plt.Circle(pos, circle_size, color='r', fill=False, alpha=0.8)
                 ax.add_artist(circle)
 
@@ -383,11 +390,11 @@ def evaluate_solution(connections, tot_users):
     tot_bit_rate = connections.bit_rate.sum()
 
     # Getting percentage of users non connected
-    disc_users_percent = connections[connections.bs_index.isnull()].shape[0] / tot_users * 100
+    connected_users_percent = 100 - connections[connections.bs_index.isnull()].shape[0] / tot_users * 100
 
     solution_result = {
         'tot_bit_rate': tot_bit_rate,
-        'disc_users_percent': disc_users_percent
+        'connected_users': connected_users_percent
     }
 
     return solution_result
@@ -399,7 +406,7 @@ def show_solution(bs, users, connections, tot_users):
     solution = evaluate_solution(connections, tot_users)
 
     print('Network bit rate is', solution['tot_bit_rate'], '[Mbit/s]')
-    print('Users disconnected:', solution['disc_users_percent'], '%')
+    print('Connected users:', solution['connected_users'], '%')
 
     # Plotting users/base stations and related connections
     plot_positions(bs, users, connections)
@@ -416,7 +423,23 @@ def compute_path_losses(bs, users):
 
             # Computing path loss between user and base station
             path_loss = compute_path_loss(dist)
+
             path_losses.append([bsi, ui, user.type, user.x, user.y, path_loss])
+
+    return pd.DataFrame(path_losses, columns=['bs_index', 'u_index', 'type', 'x', 'y', 'path_loss'])
+
+
+def compute_user_path_loss(bs, user):
+    path_losses = []
+    for bsi, base in bs.iterrows():
+        # Computing distance between user and base station
+        dist = compute_distance(user.x, user.y, base.x, base.y)
+
+        # Computing path loss between user and base station
+        path_loss = compute_path_loss(dist)
+
+        if not math.isnan(path_loss):
+            path_losses.append([bsi, int(user.u_index), user.type, user.x, user.y, path_loss])
 
     return pd.DataFrame(path_losses, columns=['bs_index', 'u_index', 'type', 'x', 'y', 'path_loss'])
 
@@ -438,6 +461,28 @@ def get_free_prb_bs(bs, connections):
     return bs[bs['free_prb'] > 0]
 
 
+def update_connections_by_bs_prb(bs, connections):
+    bs = compute_bs_free_prb(bs, connections)
+
+    connections = connections.sort_values(by='bit_rate')
+    for connection_index, connection in connections.iterrows():
+
+        if connection['bs_index'] is None:
+            continue
+
+        bs_index = int(connection['bs_index'])
+
+        if bs.at[bs_index, 'free_prb'] < 0 or connection['bit_rate'] == 0:
+            connections.at[connection_index, 'bs_index'] = None
+            connections.at[connection_index, 'bit_rate'] = 0.0
+            bs.at[bs_index, 'free_prb'] += get_user(connection.type).num_prb
+
+        # TODO: capire perché i bs_index vengono impostati come NaN e non come None (poi rimuovere questa riga)
+        connections = connections.where(pd.notnull(connections), None)
+
+    return connections, bs
+
+
 # Computes BS/users minimum path loss connections
 def compute_min_path_losses_connections(bs, path_losses, consider_max_prb=True):
 
@@ -455,10 +500,7 @@ def compute_min_path_losses_connections(bs, path_losses, consider_max_prb=True):
     connections['x'] = None
     connections['y'] = None
 
-    if consider_max_prb:
-        user_path_losses = path_losses.groupby('u_index')
-    else:
-        user_path_losses = path_losses.sort_values(by='path_loss').groupby('u_index')
+    user_path_losses = path_losses.sort_values(by='path_loss').groupby('u_index')
 
     # Iterating on user path loss grouped by index
     for user_index, user_path_loss in user_path_losses:
@@ -466,17 +508,18 @@ def compute_min_path_losses_connections(bs, path_losses, consider_max_prb=True):
         # Iterating on single users
         for row_index, row in user_path_loss.iterrows():
 
+            bs_index = int(row.bs_index)
+
             # Computing free PRB for current base station
-            free_prb = bs.at[row.bs_index, 'free_prb'] - get_user(row.type).num_prb
+            free_prb = bs.at[bs_index, 'free_prb'] - get_user(row.type).num_prb
 
             is_free_prb = free_prb >= 0 or not consider_max_prb
 
             # A BS is considered valid (just in case of exclusive BS hypothesis)
             # when its type is the same as the user
             is_valid_bs = True
-            if is_bs_exclusive and bs.at[row.bs_index, 'bs_type'] is not None:
-
-                is_valid_bs = bs.at[row.bs_index, 'bs_type'] == row.type
+            if is_bs_exclusive and bs.at[bs_index, 'bs_type'] is not None:
+                is_valid_bs = bs.at[bs_index, 'bs_type'] == row.type
 
             # Computing visibility according to bs/users path loss
             is_visible = get_user(row.type).is_visible_by_path_loss(row.path_loss)
@@ -504,6 +547,54 @@ def compute_min_path_losses_connections(bs, path_losses, consider_max_prb=True):
     return connections
 
 
+def adjust_min_path_loss_connections(bs, user_connections):
+
+    # Updating out of max PRB connections
+    user_connections, bs = update_connections_by_bs_prb(bs, user_connections)
+
+    # Iterating on user by index
+    for user_index, user_connection in user_connections.iterrows():
+
+        if user_connection.bs_index is not None:
+            continue
+
+        user_path_losses = compute_user_path_loss(bs, user_connection)
+        user_path_losses = user_path_losses.sort_values(by='path_loss')
+
+        for user_path_loss_index, user_path_loss in user_path_losses.iterrows():
+
+            # Computing free PRB for current base station
+            free_prb = bs.iloc[user_path_loss.bs_index]['free_prb'] - get_user(user_path_loss.type).num_prb
+
+            is_free_prb = free_prb >= 0
+
+            # A BS is considered valid (just in case of exclusive BS hypothesis)
+            # when its type is the same as the user
+            is_valid_bs = True
+            if is_bs_exclusive and bs.at[user_path_loss.bs_index, 'bs_type'] is not None:
+                is_valid_bs = bs.at[user_path_loss.bs_index, 'bs_type'] == user_path_loss.type
+
+            # Computing visibility according to bs/users path loss
+            is_visible = get_user(user_connection.type).is_visible_by_path_loss(user_path_loss.path_loss)
+
+            if is_free_prb and is_valid_bs and is_visible:
+
+                # Reducing the available PRB for current base station
+                bs.at[user_path_loss.bs_index, 'free_prb'] = free_prb
+
+                if is_bs_exclusive:
+                    bs.at[user_connection.bs_index, 'bs_type'] = user_path_loss.type
+
+                # Allocating current user (u_index) to current base station (bs_index)
+                user_connections.at[user_index, 'bs_index'] = user_path_loss.bs_index
+                user_connections.at[user_index, 'bit_rate'] = get_user(user_path_loss.type).get_bit_rate(
+                    user_path_loss.path_loss)
+
+                break
+
+    return user_connections
+
+
 class UsersAllocationPredictor:
 
     def __init__(self, bs, training='genetic', classifier=svm.SVC()):
@@ -517,6 +608,8 @@ class UsersAllocationPredictor:
         # Create a Classifier
         self.classifier = classifier
 
+        self.max_prb_training = False
+
     def train(self, tot_populations, tot_users, iot_users_percent, training_percent=0.7):
 
         # Generating users
@@ -525,6 +618,13 @@ class UsersAllocationPredictor:
         if self.training == 'min_path_loss':
             # Minimum path loss training
             population = users_generator.generate_population(tot_populations)
+
+            # Computing min path loss connections
+            for population_index in population:
+                users = population[population_index]
+                path_losses = compute_path_losses(self.bs, users)
+                population[population_index] = compute_min_path_losses_connections(self.bs, path_losses,
+                                                                                   self.max_prb_training)
         else:
             # Genetic training
             users = users_generator.generate_users()
@@ -532,12 +632,6 @@ class UsersAllocationPredictor:
 
             # Computing best fitness population
             population = genetic_allocation.generate_best_solutions(tot_populations, tot_users, iot_users_percent)
-
-        # Computing min path loss connections
-        for population_index in population:
-            users = population[population_index]
-            path_losses = compute_path_losses(self.bs, users)
-            population[population_index] = compute_min_path_losses_connections(self.bs, path_losses, False)
 
         # Adapting users pandas data frame to python array
         X, y = self._adapt_population(population, True)
@@ -557,10 +651,6 @@ class UsersAllocationPredictor:
         return metrics.accuracy_score(y_test, y_pred)
 
     def predict(self, users):
-
-        # Computing min path loss connections
-        path_losses = compute_path_losses(self.bs, users)
-        users = compute_min_path_losses_connections(self.bs, path_losses, False)
 
         # Adapting users
         X, y = self._adapt_users(users)
@@ -657,9 +747,10 @@ class UsersAllocationPredictor:
 
 class GeneticAllocation:
 
-    def __init__(self, bs, users):
+    def __init__(self, bs, users, log=True):
         self.bs = bs
         self.users = users
+        self.log = log
         self.population = {}
         self.evolutions = {}
 
@@ -676,7 +767,9 @@ class GeneticAllocation:
         for generation_index in range(num_of_generation):
 
             actual_generation = generation_index + 1
-            print("Generation:", actual_generation)
+
+            if self.log:
+                print("Generation:", actual_generation)
 
             # Computing best two individuals
             first_best_individual, second_best_individual = self.fitness()
@@ -688,8 +781,9 @@ class GeneticAllocation:
             # Evaluating current solution
             solution = evaluate_solution(next_gen_individual, tot_users)
 
-            print('Total bit rate:', solution['tot_bit_rate'], '[Mbit/s]')
-            print('Users disconnected:', solution['disc_users_percent'], '%')
+            if self.log:
+                print('Total bit rate:', solution['tot_bit_rate'], '[Mbit/s]')
+                print('Users disconnected:', solution['connected_users'], '%')
 
             if actual_generation < num_of_generation:
 
@@ -891,3 +985,44 @@ class GeneticAllocation:
                 bs_indexes.remove(bs_index)
 
         return result_bs_index, result_bit_rate
+
+
+def knn(data, query, k, distance_fn, choice_fn):
+    neighbor_distances_and_indices = []
+
+    # 3. For each example in the data
+    for index, example in enumerate(data):
+        # 3.1 Calculate the distance between the query example and the current
+        # example from the data.
+        distance = distance_fn(example[:-1], query)
+
+        # 3.2 Add the distance and the index of the example to an ordered collection
+        neighbor_distances_and_indices.append((distance, index))
+
+    # 4. Sort the ordered collection of distances and indices from
+    # smallest to largest (in ascending order) by the distances
+    sorted_neighbor_distances_and_indices = sorted(neighbor_distances_and_indices)
+
+    # 5. Pick the first K entries from the sorted collection
+    k_nearest_distances_and_indices = sorted_neighbor_distances_and_indices[:k]
+
+    # 6. Get the labels of the selected K entries
+    k_nearest_labels = [data[i][1] for distance, i in k_nearest_distances_and_indices]
+
+    # 8. Return the mode of the K labels
+    return k_nearest_distances_and_indices, choice_fn(k_nearest_labels)
+
+
+def mean(labels):
+    return sum(labels) / len(labels)
+
+
+def mode(labels):
+    return Counter(labels).most_common(1)[0][0]
+
+
+def euclidean_distance(point1, point2):
+    sum_squared_distance = 0
+    for i in range(len(point1)):
+        sum_squared_distance += math.pow(point1[i] - point2[i], 2)
+    return math.sqrt(sum_squared_distance)
